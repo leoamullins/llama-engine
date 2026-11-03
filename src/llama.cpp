@@ -389,4 +389,27 @@ namespace llama
     }
     return ids;
   }
+
+  std::vector<int> Tokenizer::encode(const std::string &text) const
+  {
+    std::vector<int> ids;
+    std::string current;
+    for (char c : text)
+    {
+      // a space starts a new word, and stays attached to the front of it
+      if (c == ' ' && !current.empty())
+      {
+        std::vector<int> chunk_ids = encode_chunk(current);
+        ids.insert(ids.end(), chunk_ids.begin(), chunk_ids.end());
+        current.clear();
+      }
+      current += c;
+    }
+    if (!current.empty())
+    {
+      std::vector<int> chunk_ids = encode_chunk(current);
+      ids.insert(ids.end(), chunk_ids.begin(), chunk_ids.end());
+    }
+    return ids;
+  }
 }

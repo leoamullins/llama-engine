@@ -80,6 +80,7 @@ namespace llama
     explicit Tokenizer(const std::string &vocab_path);
     const std::string &decode(int id) const;
     std::string decode(const std::vector<int> &ids) const;
+    std::vector<int> encode(const std::string &text) const;
     int vocab_size() const;
 
   private:
