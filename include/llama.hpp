@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <mapped_file.hpp>
 #include <random>
 #include <stdio.h>
@@ -10,7 +11,7 @@ namespace llama
 
   struct Config
   {
-    int dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, max_seq_len;
+    int dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, max_seq_len_;
     float rope_theta, norm_eps;
   };
 
@@ -64,16 +65,27 @@ namespace llama
   class Sampler
   {
   public:
-    Sampler(float temperature, float top_p, uint64_t seed);
+    Sampler(float temperature, float top_p, uint64_t seed, int real_vocab_size);
     int sample(const float *logits, int vocab_size);
 
   private:
     float temperature_, top_p_;
     std::mt19937_64 rng_;
+    int real_vocab_size_;
   };
 
   class Tokenizer
   {
+  public:
+    explicit Tokenizer(const std::string &vocab_path);
+    const std::string &decode(int id) const;
+    std::string decode(const std::vector<int> &ids) const;
+    int vocab_size() const;
+
+  private:
+    std::vector<std::string> pieces_;
+    std::unordered_map<std::string, int> ranks_;
+    std::vector<int> encode_chunk(const std::string &chunk) const;
   };
 
   std::string generate(Model &, Tokenizer &, Sampler &, const std::string &prompt,

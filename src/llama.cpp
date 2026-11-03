@@ -2,6 +2,7 @@
 #include "llama.hpp"
 #include "mapped_file.hpp"
 #include <vector>
+#include <fstream>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -201,5 +202,168 @@ namespace llama
     rms_norm(s_.xb.data(), s_.x.data(), w_.final_norm, dim, cfg_.norm_eps);
     matvec(s_.logits.data(), w_.output, s_.xb.data(), vocab, dim);
     return s_.logits.data();
+  }
+
+  Sampler::Sampler(float temperature, float top_p, uint64_t seed, int real_vocab_size) : temperature_(temperature), top_p_(top_p), rng_(seed), real_vocab_size_(static_cast<std::size_t>(real_vocab_size)) {}
+
+  int Sampler::sample(const float *logits, int vocab_size)
+  {
+    if (vocab_size <= 0)
+    {
+      throw std::invalid_argument("vocab_size must be positive");
+    }
+    if (temperature_ < 0.0f)
+    {
+      throw std::invalid_argument("temperature must be non-negative");
+    }
+    if (top_p_ < 0.0f || top_p_ > 1.0f)
+    {
+      throw std::invalid_argument("top_p must be in [0, 1]");
+    }
+    if (temperature_ == 0.0f)
+    {
+      // argmax
+      int max_idx = 0;
+      for (int i = 1; i < vocab_size; ++i)
+      {
+        if (logits[i] > logits[max_idx])
+        {
+          max_idx = i;
+        }
+      }
+      return max_idx;
+    }
+
+    std::vector<float> probs(static_cast<std::size_t>(vocab_size));
+    // copy logits into probs buffer, since logits is const and we may need to modify it for softmax
+    std::memcpy(probs.data(), logits, static_cast<std::size_t>(vocab_size) * sizeof(float));
+
+    // masking padded tokens
+    for (int i = real_vocab_size_; i < static_cast<int>(probs.size()); ++i)
+    {
+      probs[static_cast<std::size_t>(i)] = -std::numeric_limits<float>::infinity();
+    }
+
+    for (size_t i = 0; i < static_cast<std::size_t>(vocab_size); ++i)
+    {
+      probs[i] /= temperature_;
+    }
+    softmax(probs.data(), probs.data(), static_cast<std::size_t>(vocab_size));
+
+    // generate a random idx
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    float r = dist(rng_);
+    float cumulative = 0.0f;
+    for (int i = 0; i < vocab_size; ++i)
+    {
+      cumulative += probs[static_cast<std::size_t>(i)];
+      if (r < cumulative)
+      {
+        return i;
+      }
+    }
+    // fallback to last token if not found
+    return vocab_size - 1;
+  }
+
+  Tokenizer::Tokenizer(const std::string &vocab_path)
+  {
+    std::ifstream vocab_file(vocab_path);
+    if (!vocab_file.is_open())
+    {
+      throw std::runtime_error("Failed to open vocab file: " + vocab_path);
+    }
+
+    // first 4 bytes are the number of pieces (int32_t)
+    int32_t count = 0;
+    vocab_file.read(reinterpret_cast<char *>(&count), sizeof(count));
+
+    if (!vocab_file || count <= 0)
+    {
+      throw std::runtime_error("Invalid vocab file format or empty vocab: " + vocab_path);
+    }
+
+    // reserve space for pieces to avoid reallocations, then read each piece and for the the ranks map
+    pieces_.reserve(static_cast<std::size_t>(count));
+    ranks_.reserve(static_cast<std::size_t>(count));
+    for (int32_t i = 0; i < count; ++i)
+    {
+      int32_t length = 0;
+      vocab_file.read(reinterpret_cast<char *>(&length), sizeof(length));
+
+      std::string piece(length, '\0');
+      vocab_file.read(piece.data(), length);
+
+      ranks_[piece] = i;
+
+      pieces_.push_back(std::move(piece));
+    }
+  }
+
+  const std::string &Tokenizer::decode(int id) const
+  {
+    if (id < 0 || static_cast<std::size_t>(id) >= pieces_.size())
+    {
+      throw std::out_of_range("Token ID out of range");
+    }
+    return pieces_[static_cast<std::size_t>(id)];
+  }
+
+  std::string Tokenizer::decode(const std::vector<int> &ids) const
+  {
+    std::string result;
+    for (int id : ids)
+    {
+      result += decode(id);
+    }
+    return result;
+  }
+
+  int Tokenizer::vocab_size() const
+  {
+    return static_cast<int>(pieces_.size());
+  }
+
+  std::vector<int> Tokenizer::encode_chunk(const std::string &chunk) const
+  {
+    std::vector<std::string> parts;
+
+    parts.reserve(chunk.size());
+    for (char c : chunk)
+    {
+      std::string s(1, c);
+      parts.push_back(std::move(s));
+    }
+
+    // since the encoder was BPE (byte pair encoded) we need to merge the pieces according to the ranks_ map
+    while (true)
+    {
+      int best_rank = INT_MAX;
+      int best_i = -1;
+
+      for (std::size_t i = 0; i + 1 < parts.size(); ++i)
+      {
+        auto it = ranks_.find(parts[i] + parts[i + 1]);
+        if (it != ranks_.end() && it->second < best_rank)
+        {
+          best_rank = it->second;
+          best_i = static_cast<int>(i);
+        }
+      }
+      if (best_i == -1)
+      {
+        break;
+      }
+      parts[best_i] += parts[best_i + 1];
+      parts.erase(parts.begin() + best_i + 1);
+    }
+
+    std::vector<int> ids;
+    ids.reserve(parts.size());
+    for (const std::string &part : parts)
+    {
+      ids.push_back(ranks_.at(part));
+    }
+    return ids;
   }
 }
