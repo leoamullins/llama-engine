@@ -198,7 +198,7 @@ namespace llama
     {
       // attention then feed forward
     }
-    rms_norm(s_.x.data(), s_.x.data(), w_.final_norm, dim, cfg_.norm_eps);
+    rms_norm(s_.xb.data(), s_.x.data(), w_.final_norm, dim, cfg_.norm_eps);
     matvec(s_.logits.data(), w_.output, s_.xb.data(), vocab, dim);
     return s_.logits.data();
   }
