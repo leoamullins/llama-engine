@@ -11,7 +11,7 @@ namespace llama
 
   struct Config
   {
-    int dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, max_seq_len_;
+    int dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, max_seq_len;
     float rope_theta, norm_eps;
   };
 

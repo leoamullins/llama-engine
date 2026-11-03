@@ -7,6 +7,10 @@
 #include <cstring>
 #include <stdexcept>
 #include <cmath>
+#include <climits>
+#include <limits>
+#include <algorithm>
+#include <numeric>
 
 namespace llama
 {
@@ -22,7 +26,7 @@ namespace llama
       std::memcpy(&cfg, file.data(), sizeof(Config));
 
       if (cfg.dim <= 0 || cfg.hidden_dim <= 0 || cfg.n_layers <= 0 || cfg.n_heads <= 0 ||
-          cfg.n_kv_heads <= 0 || cfg.vocab_size <= 0 || cfg.max_seq_len_ <= 0)
+          cfg.n_kv_heads <= 0 || cfg.vocab_size <= 0 || cfg.max_seq_len <= 0)
       {
         throw std::runtime_error("Config fields must be positive");
       }
@@ -50,7 +54,7 @@ namespace llama
     }
   }
 
-  KVCache::KVCache(const Config &cfg) : max_seq_len_(cfg.max_seq_len_),
+  KVCache::KVCache(const Config &cfg) : max_seq_len_(cfg.max_seq_len),
                                         kv_dim_(cfg.n_kv_heads * cfg.dim / cfg.n_heads),
                                         k_(static_cast<std::size_t>(cfg.n_layers) * max_seq_len_ * kv_dim_),
                                         v_(k_.size()) {}
@@ -65,7 +69,7 @@ namespace llama
     return v_.data() + (static_cast<std::size_t>(layer * max_seq_len_ + pos) * kv_dim_);
   }
 
-  RunState::RunState(const Config &cfg) : x(cfg.dim), xb(cfg.dim), xb2(cfg.dim), q(cfg.dim), hb(cfg.hidden_dim), hb2(cfg.hidden_dim), att(cfg.n_heads * cfg.max_seq_len_), logits(cfg.vocab_size) {}
+  RunState::RunState(const Config &cfg) : x(cfg.dim), xb(cfg.dim), xb2(cfg.dim), q(cfg.dim), hb(cfg.hidden_dim), hb2(cfg.hidden_dim), att(cfg.n_heads * cfg.max_seq_len), logits(cfg.vocab_size) {}
 
   Model::Model(const std::string &checkpoint_path)
       : file_(checkpoint_path), cfg_(read_config(file_)), w_(), cache_(cfg_), s_(cfg_)
@@ -185,7 +189,7 @@ namespace llama
     {
       throw std::out_of_range("token out of range");
     }
-    if (pos < 0 || pos >= cfg_.max_seq_len_)
+    if (pos < 0 || pos >= cfg_.max_seq_len)
     {
       throw std::out_of_range("pos out of range");
     }
@@ -222,9 +226,10 @@ namespace llama
     }
     if (temperature_ == 0.0f)
     {
-      // argmax
+      // argmax, skipping padded tokens
+      int n_real = std::min(real_vocab_size_, vocab_size);
       int max_idx = 0;
-      for (int i = 1; i < vocab_size; ++i)
+      for (int i = 1; i < n_real; ++i)
       {
         if (logits[i] > logits[max_idx])
         {
@@ -250,20 +255,38 @@ namespace llama
     }
     softmax(probs.data(), probs.data(), static_cast<std::size_t>(vocab_size));
 
-    // generate a random idx
-    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-    float r = dist(rng_);
-    float cumulative = 0.0f;
-    for (int i = 0; i < vocab_size; ++i)
+    // top-p: sort token ids by probability, keep the smallest prefix whose mass reaches top_p_
+    std::vector<int> order(static_cast<std::size_t>(vocab_size));
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](int a, int b)
+              { return probs[static_cast<std::size_t>(a)] > probs[static_cast<std::size_t>(b)]; });
+
+    float kept_mass = 0.0f;
+    std::size_t n_kept = 0;
+    while (n_kept < order.size())
     {
-      cumulative += probs[static_cast<std::size_t>(i)];
-      if (r < cumulative)
+      kept_mass += probs[static_cast<std::size_t>(order[n_kept])];
+      ++n_kept;
+      if (kept_mass >= top_p_)
       {
-        return i;
+        break;
       }
     }
-    // fallback to last token if not found
-    return vocab_size - 1;
+
+    // generate a random idx within the kept set, scaled so it doesn't need renormalizing
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    float r = dist(rng_) * kept_mass;
+    float cumulative = 0.0f;
+    for (std::size_t i = 0; i < n_kept; ++i)
+    {
+      cumulative += probs[static_cast<std::size_t>(order[i])];
+      if (r < cumulative)
+      {
+        return order[i];
+      }
+    }
+    // fallback to the last kept token if not found
+    return order[n_kept - 1];
   }
 
   Tokenizer::Tokenizer(const std::string &vocab_path)
