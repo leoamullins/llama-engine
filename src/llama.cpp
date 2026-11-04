@@ -1,4 +1,3 @@
-// In progress
 #include "llama.hpp"
 #include "mapped_file.hpp"
 #include <vector>
@@ -499,5 +498,41 @@ namespace llama
       ids.insert(ids.end(), chunk_ids.begin(), chunk_ids.end());
     }
     return ids;
+  }
+
+  std::string generate(Model &model, Tokenizer &tokenizer, Sampler &sampler, const std::string &prompt, int max_new_tokens)
+  {
+    const Config &cfg = model.config();
+    constexpr int eot = 50256; // GPT-2 <|endoftext|>
+
+    std::vector<int> tokens = tokenizer.encode(prompt);
+    if (tokens.empty())
+    {
+      tokens.push_back(eot);
+    }
+    if (static_cast<int>(tokens.size()) >= cfg.max_seq_len)
+    {
+      throw std::invalid_argument("prompt longer than max_seq_len");
+    }
+
+    const float *logits = nullptr;
+    int pos = 0;
+    for (int token : tokens)
+    {
+      logits = model.forward(token, pos++);
+    }
+
+    std::string out;
+    for (int i = 0; i < max_new_tokens && pos < cfg.max_seq_len; ++i)
+    {
+      const int next = sampler.sample(logits, cfg.vocab_size);
+      if (next == eot)
+      {
+        break;
+      }
+      out += tokenizer.decode(next);
+      logits = model.forward(next, pos++);
+    }
+    return out;
   }
 }
