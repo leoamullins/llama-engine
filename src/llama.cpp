@@ -171,14 +171,15 @@ namespace llama
 
     void apply_rope(float *x, std::size_t head_dim, int pos, float theta)
     {
+      const std::size_t half = head_dim / 2;
       for (std::size_t i = 0; i < head_dim / 2; ++i)
       {
         const float exponent = static_cast<float>(2 * i) / head_dim;
         const float angle = pos / std::pow(theta, exponent);
         const float c = std::cos(angle), s = std::sin(angle);
-        const float a = x[2 * i], b = x[2 * i + 1];
-        x[2 * i] = a * c - b * s;
-        x[2 * i + 1] = a * s + b * c;
+        const float a = x[i], b = x[i + half];
+        x[i] = a * c - b * s;
+        x[i + half] = a * s + b * c;
       }
     }
   }
@@ -194,15 +195,102 @@ namespace llama
       throw std::out_of_range("pos out of range");
     }
 
-    const std::size_t dim = cfg_.dim, vocab = cfg_.vocab_size;
+    const std::size_t dim = cfg_.dim, vocab = cfg_.vocab_size, hidden = cfg_.hidden_dim;
 
     // each row of tok_embeddings is one tokens vector
     std::memcpy(s_.x.data(), w_.tok_embeddings + static_cast<std::size_t>(token) * dim, dim * sizeof(float));
 
-    for (const LayerWeights &l : w_.layers)
+    for (int layer = 0; layer < cfg_.n_layers; ++layer)
     {
-      // attention then feed forward
+      const LayerWeights &l = w_.layers[layer];
+
+      rms_norm(s_.xb.data(), s_.x.data(), l.attn_norm, dim, cfg_.norm_eps);
+
+      // calculate q, k, v
+      // using the KV Cache to store k and v for each layer and position
+      matvec(s_.q.data(), l.wq, s_.xb.data(), dim, dim);
+
+      float *k = cache_.k(layer, pos);
+      float *v = cache_.v(layer, pos);
+      matvec(k, l.wk, s_.xb.data(), cfg_.n_kv_heads * dim / cfg_.n_heads, dim);
+      matvec(v, l.wv, s_.xb.data(), cfg_.n_kv_heads * dim / cfg_.n_heads, dim);
+
+      std::size_t head_dim = dim / cfg_.n_heads;
+
+      for (int h = 0; h < cfg_.n_heads; ++h)
+      {
+        apply_rope(s_.q.data() + h * head_dim, head_dim, pos, cfg_.rope_theta);
+      }
+      for (int h = 0; h < cfg_.n_kv_heads; ++h)
+      {
+        apply_rope(k + h * head_dim, head_dim, pos, cfg_.rope_theta);
+      }
+
+      // attention scores
+      const int kv_mul = cfg_.n_heads / cfg_.n_kv_heads;
+      const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+      for (int h = 0; h < cfg_.n_heads; ++h)
+      {
+        const float *q_h = s_.q.data() + h * head_dim;
+        float *att = s_.att.data() + h * cfg_.max_seq_len;
+        const int kv_h = h / kv_mul;
+
+        for (int t = 0; t <= pos; ++t)
+        {
+          const float *k_t = cache_.k(layer, t) + kv_h * head_dim;
+          float score = 0.0f;
+          for (std::size_t i = 0; i < head_dim; ++i)
+          {
+            score += q_h[i] * k_t[i];
+          }
+          att[t] = score * scale;
+        }
+
+        softmax(att, att, pos + 1);
+
+        float *out_h = s_.xb.data() + h * head_dim;
+        std::fill(out_h, out_h + head_dim, 0.0f);
+
+        for (int i = 0; i <= pos; ++i)
+        {
+          const float *v_t = cache_.v(layer, i) + kv_h * head_dim;
+          const float a = att[i];
+          for (std::size_t j = 0; j < head_dim; ++j)
+          {
+            out_h[j] += a * v_t[j];
+          }
+        }
+      }
+      // residual + attention output proj
+      matvec(s_.xb2.data(), l.wo, s_.xb.data(), dim, dim);
+      for (std::size_t i = 0; i < dim; ++i)
+      {
+        s_.x[i] += s_.xb2[i];
+      }
+
+      // rms norm before ffn (x is storing prenorm vals)
+      rms_norm(s_.xb.data(), s_.x.data(), l.ffn_norm, dim, cfg_.norm_eps);
+
+      // project up with w1 and w3
+      matvec(s_.hb.data(), l.w1, s_.xb.data(), hidden, dim);  // hb = w1 * x (gate)
+      matvec(s_.hb2.data(), l.w3, s_.xb.data(), hidden, dim); // hb2 = w3 * x (up)
+
+      silu(s_.hb.data(), s_.hb.data(), hidden);
+      for (std::size_t i = 0; i < hidden; ++i)
+      {
+        s_.hb[i] *= s_.hb2[i];
+      }
+
+      // project back down
+      matvec(s_.xb2.data(), l.w2, s_.hb.data(), dim, hidden); // xb2 = w2 * hb
+
+      for (std::size_t i = 0; i < dim; ++i)
+      {
+        s_.x[i] += s_.xb2[i];
+      }
     }
+
     rms_norm(s_.xb.data(), s_.x.data(), w_.final_norm, dim, cfg_.norm_eps);
     matvec(s_.logits.data(), w_.output, s_.xb.data(), vocab, dim);
     return s_.logits.data();
